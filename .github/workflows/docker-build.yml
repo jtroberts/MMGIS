@@ -51,6 +51,7 @@ jobs:
       - name: Generate tags
         id: generate
         run: |
+          IMAGE_ID=$(echo "ghcr.io/$IMAGE_SLUG" | tr '[A-Z]' '[a-z]')
           PATCH_VERSION=$(jq .version -r ./package.json)
           BRANCH_OR_TAG=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
 
