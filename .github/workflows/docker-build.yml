@@ -92,7 +92,7 @@ jobs:
       - name: Docker buildx build and push (AMD64)
         run: |
           IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          TAG="${{ needs.generate-tags.outputs.tags }}-amd64"
+          TAG="${{ needs.generate-tags.outputs.tags }}"
           docker buildx build --platform linux/amd64 --tag "$IMAGE_ID:$TAG" --push .
 
   # Build and push ARM64 image on ARM64 runner
