@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'release'
     outputs:
-      registry-tags: ${{ steps.generate.outputs.REGISTRY_TAGS }}
+      tags: ${{ steps.generate.outputs.TAGS }}
       image-id: ${{ steps.generate.outputs.IMAGE_ID }}
     steps:
       - name: Checkout
@@ -51,64 +51,24 @@ jobs:
       - name: Generate tags
         id: generate
         run: |
-
-          # Image ID
-          IMAGE_ID=ghcr.io/$IMAGE_SLUG
-
-          # Date
-          BDATE=$(date +%Y%m%d)
-
-          # PATCH_VERSION from package.json is like "1.2.3"
-          # MINOR_VERSION like "1.2", MAJOR_VERSION like "1"
           PATCH_VERSION=$(jq .version -r ./package.json)
-          MINOR_VERSION=${PATCH_VERSION%.*}
-          MAJOR_VERSION=${MINOR_VERSION%.*}
+          BRANCH_OR_TAG=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
 
-          # Change all uppercase to lowercase, just in case
-          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
+          TAGS=""
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            PR_NUMBER=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\)/merge,\1,')
+            TAGS="$PATCH_VERSION-$(date +%Y%m%d)-$PR_NUMBER"
+          elif [[ "$BRANCH_OR_TAG" == "master" ]]; then
+            TAGS="latest $PATCH_VERSION-latest"
+          elif [[ "$BRANCH_OR_TAG" == "development" ]]; then
+            TAGS="development"
+          elif [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
+            TAGS="$BRANCH_OR_TAG"
+          fi
 
-          # Strip git ref prefix from version and use it as suffix for version
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          # For pull requests just extract the PR number
-          PR_NUMBER=""
-          [ "${{ github.event_name }}" == "pull_request" ] && VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\)/merge,\1,')
-          [ "${{ github.event_name }}" == "pull_request" ] && PR_NUMBER=$VERSION
-
-          # Append version
-          [ "${{ github.event_name }}" == "pull_request" ] && VERSION=$PATCH_VERSION-$BDATE-$VERSION
-
-          # Strip "v" prefix from tag name if it's a tag
-          # [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
-
-          # Use Docker `latest` tag convention if it's a master branch build
-          [ "$VERSION" == "master" ] && VERSION=latest
-          [ "$VERSION" == "development" ] && VERSION=development
-          [ "${{ github.event_name }}" == "release" ] && VERSION=release
-
-          # Compose REGISTRY_TAGS variable for buildx (space-separated with --tag flags)
-          REGISTRY_TAGS="--tag $IMAGE_ID:$VERSION"
-
-          # For master branch also supply an extra tag: <PATCH_VERSION>-latest,<MINOR_VERSION>-latest,<MAJOR_VERSION>-latest,<PATCH_VERSION>-<DATE>-<SHA>
-          [ "$VERSION" == "latest" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$PATCH_VERSION-latest --tag $IMAGE_ID:$MINOR_VERSION-latest --tag $IMAGE_ID:$MAJOR_VERSION-latest --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
-          [ "$VERSION" == "development" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$MAJOR_VERSION-development --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
-          [ "$VERSION" == "release" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$PATCH_VERSION-release --tag $IMAGE_ID:$MINOR_VERSION-release --tag $IMAGE_ID:$MAJOR_VERSION-release --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
-
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-          echo REGISTRY_TAGS=$REGISTRY_TAGS
-          echo headref=${{ github.head_ref }}
-
-          SHA_SHORT=${{ github.sha }}
-          [ "${{ github.event_name }}" == "pull_request" ] && SHA_SHORT=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-8)
-
-          echo "Final image tags to be pushed:"
-          echo $REGISTRY_TAGS
-          echo "REGISTRY_TAGS=$REGISTRY_TAGS" >> $GITHUB_OUTPUT
+          echo "Generated tags: $TAGS"
+          echo "TAGS=$TAGS" >> $GITHUB_OUTPUT
           echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
-          echo "REGISTRY_TAGS_VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "REGISTRY_TAGS_PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "SHA_SHORT=$SHA_SHORT" >> $GITHUB_OUTPUT
 
   # Build and push AMD64 image on x64 runner
   build-amd64:
@@ -126,9 +86,13 @@ jobs:
 
       - name: Docker buildx build and push (AMD64)
         run: |
+          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
+          # Create a set of --tag arguments with the -amd64 suffix
+          ARCH_TAGS=$(for tag in ${{ needs.generate-tags.outputs.tags }}; do echo "--tag $IMAGE_ID:$tag-amd64"; done)
+          
           docker buildx build \
             --platform linux/amd64 \
-            ${{ needs.generate-tags.outputs.registry-tags }} \
+            $ARCH_TAGS \
             --push \
             --no-cache \
             .
@@ -149,11 +113,38 @@ jobs:
 
       - name: Docker buildx build and push (ARM64)
         run: |
-          # Generate ARM64-specific tags by adding -arm64 suffix
-          ARM64_TAGS="${{ needs.generate-tags.outputs.registry-tags }}-arm64"
+          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
+          # Create a set of --tag arguments with the -arm64 suffix
+          ARCH_TAGS=$(for tag in ${{ needs.generate-tags.outputs.tags }}; do echo "--tag $IMAGE_ID:$tag-arm64"; done)
+          
           docker buildx build \
             --platform linux/arm64 \
-            ${ARM64_TAGS} \
+            $ARCH_TAGS \
             --push \
             --no-cache \
             .
+
+  # Create and push multi-arch manifest
+  publish-manifest:
+    needs: [build-amd64, build-arm64] # Runs after both builds are successful
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        run: |
+          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
+          for tag in ${{ needs.generate-tags.outputs.tags }}; do
+            echo "Creating manifest for $IMAGE_ID:$tag"
+            docker manifest create $IMAGE_ID:$tag \
+              --amend $IMAGE_ID:$tag-amd64 \
+              --amend $IMAGE_ID:$tag-arm64
+            
+            echo "Pushing manifest for $IMAGE_ID:$tag"
+            docker manifest push $IMAGE_ID:$tag
+          done
