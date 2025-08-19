@@ -75,55 +75,71 @@ jobs:
   build-amd64:
     needs: generate-tags
     runs-on: ubuntu-latest  # x64 runner for native AMD64 builds
+    outputs: # Define the job output for the digest
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
 
       - name: Login to GHCR
-        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.actor }} --password-stdin ghcr.io
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker buildx build and push (AMD64)
         run: |
           IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          # Create a set of --tag arguments with the -amd64 suffix
-          ARCH_TAGS=$(for tag in ${{ needs.generate-tags.outputs.tags }}; do echo "--tag $IMAGE_ID:$tag-amd64"; done)
-          
+
+          # This pushes the image referenced only by its digest, keeping the registry clean.
           docker buildx build \
             --platform linux/amd64 \
-            $ARCH_TAGS \
-            --push \
-            --no-cache \
+            --output "type=image,name=$IMAGE_ID,push=true" \
+            --metadata-file metadata-amd64.json \
             .
+
+          # Extracts the unique digest from the build metadata for the final manifest.
+          DIGEST=$(jq -r '.["containerimage.digest"]' metadata-amd64.json)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
   # Build and push ARM64 image on ARM64 runner
   build-arm64:
     needs: generate-tags
     runs-on: ubuntu-24.04-arm  # ARM64 runner for native ARM64 builds
+    outputs: # Define the job output for the digest
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
 
       - name: Login to GHCR
-        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.actor }} --password-stdin ghcr.io
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker buildx build and push (ARM64)
         run: |
           IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          # Create a set of --tag arguments with the -arm64 suffix
-          ARCH_TAGS=$(for tag in ${{ needs.generate-tags.outputs.tags }}; do echo "--tag $IMAGE_ID:$tag-arm64"; done)
-          
+
+          # Pushes the arm64 image by digest.
           docker buildx build \
             --platform linux/arm64 \
-            $ARCH_TAGS \
-            --push \
-            --no-cache \
+            --output "type=image,name=$IMAGE_ID,push=true" \
+            --metadata-file metadata-arm64.json \
             .
+
+          # Extracts the unique digest.
+          DIGEST=$(jq -r '.["containerimage.digest"]' metadata-arm64.json)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
   # Create and push multi-arch manifest
   publish-manifest:
@@ -131,21 +147,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push manifest list
+      - name: Create and push manifest list using digests
         run: |
           IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
+          AMD64_DIGEST="${{ needs.build-amd64.outputs.digest }}"
+          ARM64_DIGEST="${{ needs.build-arm64.outputs.digest }}"
+          
+          # Loops through the tags generated in the first job (e.g., "latest", "1.2.3")
           for tag in ${{ needs.generate-tags.outputs.tags }}; do
-            echo "Creating manifest for $IMAGE_ID:$tag"
-            docker manifest create $IMAGE_ID:$tag \
-              --amend $IMAGE_ID:$tag-amd64 \
-              --amend $IMAGE_ID:$tag-arm64
+            echo "Creating and pushing manifest for tag: $tag"
             
-            echo "Pushing manifest for $IMAGE_ID:$tag"
+            # Creates a manifest list with pointers to the specific arch images.
+            docker manifest create $IMAGE_ID:$tag \
+              --amend $IMAGE_ID@$AMD64_DIGEST \
+              --amend $IMAGE_ID@$ARM64_DIGEST
+            
+            # Pushes the final, user-facing multi-arch tag to the registry.
             docker manifest push $IMAGE_ID:$tag
           done
