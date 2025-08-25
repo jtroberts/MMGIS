@@ -30,7 +30,7 @@ env:
   IMAGE_SLUG: ${{ github.repository }}
 
 jobs:
-  # Generate shared tags for both architectures
+  # Push image to GitHub Container Registry.
   # The image tag pattern is:
   # for pull-requests: <PATCH_VERSION>-<DATE>-<PR_NUMBER>, eg: 1.35.2-20210125-25
   # for tags: <TAG>
@@ -38,104 +38,88 @@ jobs:
   # for `development` branch: development,<MAJOR_VERSION>-development,<PATCH_VERSION>-<DATE>-<SHA>
   # for releases: release,<PATCH_VERSION>-release,<MINOR_VERSION>-release,<MAJOR_VERSION>-release,<PATCH_VERSION>-<DATE>-<SHA>
   # Version is parsed from package.json
-  generate-tags:
-    runs-on: ubuntu-latest
+  push:
+    runs-on: ubuntu-24.04-arm
     if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'release'
-    outputs:
-      tags: ${{ steps.generate.outputs.TAGS }}
-      image-id: ${{ steps.generate.outputs.IMAGE_ID }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
 
       - name: Generate tags
         id: generate
         run: |
-          IMAGE_ID=$(echo "ghcr.io/$IMAGE_SLUG" | tr '[A-Z]' '[a-z]')
+
+          # Image ID
+          IMAGE_ID=ghcr.io/$IMAGE_SLUG
+
+          # Date
+          BDATE=$(date +%Y%m%d)
+
+          # PATCH_VERSION from package.json is like "1.2.3"
+          # MINOR_VERSION like "1.2", MAJOR_VERSION like "1"
           PATCH_VERSION=$(jq .version -r ./package.json)
-          BRANCH_OR_TAG=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+          MINOR_VERSION=${PATCH_VERSION%.*}
+          MAJOR_VERSION=${MINOR_VERSION%.*}
 
-          TAGS=""
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            PR_NUMBER=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\)/merge,\1,')
-            TAGS="$PATCH_VERSION-$(date +%Y%m%d)-$PR_NUMBER"
-          elif [[ "$BRANCH_OR_TAG" == "master" ]]; then
-            TAGS="latest $PATCH_VERSION-latest"
-          elif [[ "$BRANCH_OR_TAG" == "development" ]]; then
-            TAGS="development"
-          elif [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
-            TAGS="$BRANCH_OR_TAG"
-          fi
+          # Change all uppercase to lowercase, just in case
+          IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
 
-          echo "Generated tags: $TAGS"
-          echo "TAGS=$TAGS" >> $GITHUB_OUTPUT
+          # Strip git ref prefix from version and use it as suffix for version
+          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+
+          # For pull requests just extract the PR number
+          PR_NUMBER=""
+          [ "${{ github.event_name }}" == "pull_request" ] && VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\)/merge,\1,')
+          [ "${{ github.event_name }}" == "pull_request" ] && PR_NUMBER=$VERSION
+
+          # Append version
+          [ "${{ github.event_name }}" == "pull_request" ] && VERSION=$PATCH_VERSION-$BDATE-$VERSION
+
+          # Strip "v" prefix from tag name if it's a tag
+          # [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+
+          # Use Docker `latest` tag convention if it's a master branch build
+          [ "$VERSION" == "master" ] && VERSION=latest
+          [ "$VERSION" == "development" ] && VERSION=development
+          [ "${{ github.event_name }}" == "release" ] && VERSION=release
+
+          # Compose REGISTRY_TAGS variable for buildx (space-separated with --tag flags)
+          REGISTRY_TAGS="--tag $IMAGE_ID:$VERSION"
+
+          # For master branch also supply an extra tag: <PATCH_VERSION>-latest,<MINOR_VERSION>-latest,<MAJOR_VERSION>-latest,<PATCH_VERSION>-<DATE>-<SHA>
+          [ "$VERSION" == "latest" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$PATCH_VERSION-latest --tag $IMAGE_ID:$MINOR_VERSION-latest --tag $IMAGE_ID:$MAJOR_VERSION-latest --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
+          [ "$VERSION" == "development" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$MAJOR_VERSION-development --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
+          [ "$VERSION" == "release" ] && REGISTRY_TAGS="$REGISTRY_TAGS --tag $IMAGE_ID:$PATCH_VERSION-release --tag $IMAGE_ID:$MINOR_VERSION-release --tag $IMAGE_ID:$MAJOR_VERSION-release --tag $IMAGE_ID:$PATCH_VERSION-$BDATE-$(git rev-parse --short HEAD)"
+
+          echo IMAGE_ID=$IMAGE_ID
+          echo VERSION=$VERSION
+          echo REGISTRY_TAGS=$REGISTRY_TAGS
+          echo headref=${{ github.head_ref }}
+
+          SHA_SHORT=${{ github.sha }}
+          [ "${{ github.event_name }}" == "pull_request" ] && SHA_SHORT=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-8)
+
+          echo "Final image tags to be pushed:"
+          echo $REGISTRY_TAGS
+          echo "REGISTRY_TAGS=$REGISTRY_TAGS" >> $GITHUB_OUTPUT
           echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
-
-  # Build and push AMD64 image on x64 runner
-  build-amd64:
-    needs: generate-tags
-    runs-on: ubuntu-latest  # x64 runner for native AMD64 builds
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+          echo "REGISTRY_TAGS_VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "REGISTRY_TAGS_PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "SHA_SHORT=$SHA_SHORT" >> $GITHUB_OUTPUT
 
       - name: Login to GHCR
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.actor }} --password-stdin ghcr.io
 
-      - name: Docker buildx build and push (AMD64)
+      - name: Docker buildx build and push
         run: |
-          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          TAG="${{ needs.generate-tags.outputs.tags }}-amd64"
-          docker buildx build --platform linux/amd64 --tag "$IMAGE_ID:$TAG" --push .
-
-  # Build and push ARM64 image on ARM64 runner
-  build-arm64:
-    needs: generate-tags
-    runs-on: ubuntu-24.04-arm  # ARM64 runner for native ARM64 builds
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
-
-      - name: Login to GHCR
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Docker buildx build and push (ARM64)
-        run: |
-          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          TAG="${{ needs.generate-tags.outputs.tags }}-arm64"
-          docker buildx build --platform linux/arm64 --tag "$IMAGE_ID:$TAG" --push .
-
-  # Create and push multi-arch manifest
-  publish-manifest:
-    needs: [build-amd64, build-arm64] # Runs after both builds are successful
-    runs-on: ubuntu-latest
-    steps:
-      - name: Login to GHCR
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create and push manifest
-        run: |
-          IMAGE_ID=${{ needs.generate-tags.outputs.image-id }}
-          BASE_TAG="${{ needs.generate-tags.outputs.tags }}"
-          docker manifest create "$IMAGE_ID:$BASE_TAG" \
-            "$IMAGE_ID:${BASE_TAG}"-amd64 \
-            "$IMAGE_ID:${BASE_TAG}-arm64"
-          docker manifest push "$IMAGE_ID:$BASE_TAG"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            ${{ steps.generate.outputs.REGISTRY_TAGS }} \
+            --push \
+            --no-cache \
+            .
