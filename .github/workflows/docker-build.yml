@@ -125,12 +125,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker build
-        # Generate AMD64-specific tags by adding -amd64 suffix
-        run: docker build --no-cache "${{ needs.generate-tags.outputs.REGISTRY_TAGS }}-arm64" .
-
-      - name: Docker push
-        run: docker push ${{ steps.generate.outputs.IMAGE_ID }} --all-tags
+      - name: Docker buildx build and push (ARM64)
+        run: |
+          # Generate ARM64-specific tags by adding -arm64 suffix
+          ARM64_TAGS="${{ needs.generate-tags.outputs.registry-tags }}-arm64"
+          docker build \
+            ${ARM64_TAGS} \
+            --push \
+            --no-cache \
+            .
 
   # Build and push AMD64 image on x64 runner
   build-amd64:
@@ -147,9 +150,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker build
-        # Generate AMD64-specific tags by adding -amd64 suffix
-        run: docker build --no-cache "${{ needs.generate-tags.outputs.REGISTRY_TAGS }}-amd64" .
-
-      - name: Docker push
-        run: docker push ${{ steps.generate.outputs.IMAGE_ID }} --all-tags
+      - name: Docker buildx build and push (AMD64)
+        run: |
+          # Generate AMD64-specific tags by adding -amd64 suffix
+          AMD64_TAGS="${{ needs.generate-tags.outputs.registry-tags }}-amd64"
+          docker build \
+            ${AMD64_TAGS} \
+            --push \
+            --no-cache \
+            .
